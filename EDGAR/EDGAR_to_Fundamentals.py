@@ -12,11 +12,13 @@ can edit without touching this code. Rule syntax (column "Rule"):
     Inside an alternative, terms are combined with " + ", " - ", " * ", " / ".
       TagName              a us-gaap tag (also searched in ifrs-full, dei)
       ns:TagName           a tag from a specific namespace, e.g. ifrs-full:Revenue
-      {Column}     another column of the output (computed first)
+      {Column}             another column of the output (computed first)
       123                  a constant
     A term ending in "?" is optional (counts as 0 when missing). Every other term must
     exist for the alternative to be used. If all terms are optional, at least one must exist.
     A leading "-" negates a term, e.g. "-PaymentsToAcquirePropertyPlantAndEquipment".
+    An alternative "none if TagName" leaves the column empty when that tag exists
+    (e.g. EBIT is not meaningful for banks: "none if NoninterestIncome").
     Rules starting with "@" are filled in by the script (identifiers, dates, ...).
     Rows whose Section is "Helper" are intermediate figures: they can be referenced with
     {Name} but are not written to the output.
@@ -31,6 +33,13 @@ Examples
     # every company, straight from SEC's bulk file (no need to unzip)
     #   https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
     python EDGAR_to_Fundamentals.py --zip companyfacts.zip --years all
+
+Currencies
+    Companies reporting in another currency (20-F / 40-F filers) are converted to US dollars
+    by default: balance-sheet figures at the fiscal-year-end rate, income-statement, cash-flow
+    and per-share figures at the average rate for the year (European Central Bank rates via
+    api.frankfurter.dev, cached in fx_rates.json). Use --currency native to keep the
+    reporting currency. Currencies the ECB does not publish stay in the reporting currency.
 """
 
 import argparse
@@ -59,6 +68,7 @@ EXCHANGE_NAMES = {"NYSE": "NYSE", "Nasdaq": "NASDAQ", "OTC": "US OTC", "CBOE": "
 
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+FX_URL = "https://api.frankfurter.dev/v1/{start}..{end}?base={cur}&symbols={target}"
 
 
 # --------------------------------------------------------------------------- mapping rules
@@ -77,6 +87,9 @@ class Rule:
         self.alternatives = [] if self.special else [self._parse(a) for a in self.text.split("|")]
 
     def _parse(self, alt):
+        m = re.fullmatch(r"\s*none if\s+(\S+)\s*", alt)
+        if m:
+            return [{"op": "+", "sign": 1, "kind": "none_if", "name": m.group(1), "optional": False}]
         # Protect {Column Names} (they contain spaces) before splitting on whitespace.
         refs = []
         def keep(m):
@@ -149,6 +162,54 @@ def is_annual_duration(e):
     return "start" in e and 300 <= days(e["start"], e["end"]) <= 400
 
 
+class FxRates:
+    """Daily exchange rates (ECB, via api.frankfurter.dev), cached on disk."""
+
+    def __init__(self, target, cache_path, offline=False):
+        self.target = target
+        self.cache_path = cache_path
+        self.offline = offline
+        self.cache = {}
+        if cache_path and os.path.exists(cache_path):
+            try:
+                self.cache = json.load(open(cache_path))
+            except ValueError:
+                self.cache = {}
+        self.dirty = False
+
+    def _series(self, cur, start, end):
+        """{date: rate} for cur->target between start and end (inclusive)."""
+        key = f"{cur}:{self.target}:{start}:{end}"
+        if key not in self.cache:
+            if self.offline:
+                return {}
+            url = FX_URL.format(start=start, end=end, cur=cur, target=self.target)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "EDGARtoCSV"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+                self.cache[key] = {d: v[self.target] for d, v in data.get("rates", {}).items()}
+            except Exception as exc:  # noqa: BLE001 - unknown currency or no network
+                print(f"No exchange rate for {cur} ({exc}); keeping {cur}", file=sys.stderr)
+                self.cache[key] = {}
+            self.dirty = True
+        return self.cache[key]
+
+    def closing(self, cur, date):
+        d = dt.date.fromisoformat(date)
+        series = self._series(cur, (d - dt.timedelta(days=7)).isoformat(), date)
+        return series[max(series)] if series else None
+
+    def average(self, cur, start, end):
+        series = self._series(cur, start, end)
+        return sum(series.values()) / len(series) if series else None
+
+    def save(self):
+        if self.dirty and self.cache_path:
+            with open(self.cache_path, "w") as f:
+                json.dump(self.cache, f)
+
+
 class Company:
     """Annual figures for one company, organised by fiscal-year end date."""
 
@@ -176,12 +237,12 @@ class Company:
                     ends[e["accn"]] = e["end"]
         return ends
 
-    def year(self, fiscal_end, prefer="original"):
-        return FiscalYear(self, fiscal_end, prefer)
+    def year(self, fiscal_end, prefer="original", fx=None):
+        return FiscalYear(self, fiscal_end, prefer, fx)
 
 
 class FiscalYear:
-    def __init__(self, company, fiscal_end, prefer):
+    def __init__(self, company, fiscal_end, prefer, fx=None):
         self.company = company
         self.fiscal_end = fiscal_end
         own = {a for a, e in company.period_end_of_filing.items() if e == fiscal_end}
@@ -206,7 +267,21 @@ class FiscalYear:
         filed = [e.get("filed", "") for (ns, tag), units in self.values.items() for e in units.values()
                  if e["accn"] in own]
         self.report_date = min(filed) if filed else None
-        self.currency = self._currency()
+        self.native = self._currency()   # currency the company reports in
+        self.currency = self.native       # currency written to the output
+        self.fx = None
+        if fx and self.native != fx.target and fx.closing(self.native, fiscal_end):
+            self.fx = fx
+            self.currency = fx.target
+
+    def _rate(self, entry):
+        """Exchange rate for one fact: average for periods, closing for point-in-time."""
+        if not self.fx:
+            return 1.0
+        rate = None
+        if "start" in entry:
+            rate = self.fx.average(self.native, entry["start"], entry["end"])
+        return rate or self.fx.closing(self.native, entry["end"])
 
     def _currency(self):
         for key in (("us-gaap", "Assets"), ("ifrs-full", "Assets"), ("us-gaap", "StockholdersEquity")):
@@ -223,15 +298,17 @@ class FiscalYear:
             candidates = [(ns, tag)]
         else:
             candidates = [(ns, name) for ns in NAMESPACES]
-        cur = self.currency
+        cur = self.native
         for key in candidates:
             units = self.values.get(key)
             if not units:
                 continue
             if cur in units:
-                return units[cur]["val"] / MONEY_SCALE
+                e = units[cur]
+                return e["val"] * self._rate(e) / MONEY_SCALE
             if f"{cur}/shares" in units:
-                return units[f"{cur}/shares"]["val"] / PER_SHARE_SCALE
+                e = units[f"{cur}/shares"]
+                return e["val"] * self._rate(e) / PER_SHARE_SCALE
             if "shares" in units:
                 return units["shares"]["val"] / SHARE_SCALE
             if "pure" in units:
@@ -259,6 +336,10 @@ def evaluate(rule, fy, out, first_by_name):
         return fy.tag(t["name"])
 
     for alt in rule.alternatives:
+        if alt[0]["kind"] == "none_if":
+            if fy.tag(alt[0]["name"]) is not None:
+                return None
+            continue
         values = [term_value(t) for t in alt]
         required = [v for t, v in zip(alt, values) if not t["optional"]]
         if any(v is None for v in required):
@@ -286,8 +367,8 @@ def evaluate(rule, fy, out, first_by_name):
     return None
 
 
-def convert_year(company, fiscal_end, rules, order, first_by_name, ids, prefer, run_date):
-    fy = company.year(fiscal_end, prefer)
+def convert_year(company, fiscal_end, rules, order, first_by_name, ids, prefer, run_date, fx=None):
+    fy = company.year(fiscal_end, prefer, fx)
     ident = ids.get(company.cik, {})
     out = {}
     specials = {
@@ -430,6 +511,9 @@ def main():
     p.add_argument("--prefer", choices=["original", "restated"], default="original",
                    help="use figures as first reported (default) or the latest restated figures")
     p.add_argument("--delimiter", default="|", help="'|' (default) or ',' for CSV")
+    p.add_argument("--currency", default="USD",
+                   help="convert other currencies to this one (default USD), or 'native' to keep the reporting currency")
+    p.add_argument("--fx-cache", default=os.path.join(HERE, "fx_rates.json"), help="where exchange rates are cached")
     p.add_argument("--user-agent", default=os.environ.get("SEC_USER_AGENT"),
                    help="required for downloads, e.g. 'Jane Doe jane@example.com'")
     p.add_argument("--cik", default="", help="comma-separated CIKs to download into --input first")
@@ -447,6 +531,7 @@ def main():
         excluded = {l.strip() for l in open(a.exclusion) if l.strip()}
     ids = load_identifiers(a.tickers_file, a.identifiers, a.user_agent)
     run_date = dt.date.today().strftime("%Y%m%d")
+    fx = None if a.currency.lower() == "native" else FxRates(a.currency.upper(), a.fx_cache)
 
     os.makedirs(os.path.dirname(os.path.abspath(a.output)), exist_ok=True)
     n_rows = n_skipped = 0
@@ -476,9 +561,11 @@ def main():
             elif a.years != "all":
                 ends = ends[-int(a.years):]
             for fe in reversed(ends):
-                row = convert_year(company, fe, rules, order, first_by_name, ids, a.prefer, run_date)
+                row = convert_year(company, fe, rules, order, first_by_name, ids, a.prefer, run_date, fx)
                 write([fmt(v) for v in row])
                 n_rows += 1
+    if fx:
+        fx.save()
     print(f"Wrote {n_rows} rows to {a.output} ({n_skipped} files skipped)")
 
 
